@@ -91,6 +91,19 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
+    # Таблица для версий приложения
+    await conn.execute('''
+        CREATE TABLE IF NOT EXISTS app_version (
+            id SERIAL PRIMARY KEY,
+            stable_version TEXT NOT NULL,
+            beta_version TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    ''')
+    # Вставляем начальные версии, если таблица пуста
+    row = await conn.fetchval("SELECT COUNT(*) FROM app_version")
+    if row == 0:
+        await conn.execute("INSERT INTO app_version (stable_version, beta_version) VALUES ('1.0.0', '1.1.0-beta')")
     await conn.close()
     print("✅ База данных готова")
 
@@ -195,10 +208,10 @@ async def register_handler(request):
         }
     })
 
-# ---------- ПОИСК ПОЛЬЗОВАТЕЛЕЙ (1 символ) ----------
+# ---------- ПОИСК ПОЛЬЗОВАТЕЛЕЙ ----------
 async def search_users_handler(request):
     query = request.query.get("q", "").strip()
-    if len(query) < 1:   # исправлено: можно искать по одному символу
+    if len(query) < 1:
         return web.json_response({"users": []})
     conn = await asyncpg.connect(DATABASE_URL)
     try:
@@ -444,6 +457,33 @@ async def admin_set_subscription_handler(request):
         await conn.close()
     return web.json_response({"status": "ok", "new_end_date": new_end.isoformat()})
 
+# ---------- УПРАВЛЕНИЕ ВЕРСИЯМИ ----------
+async def get_version_handler(request):
+    # Получить версии из БД
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        row = await conn.fetchrow("SELECT stable_version, beta_version FROM app_version ORDER BY id DESC LIMIT 1")
+        if row:
+            return web.json_response({"stable": row["stable_version"], "beta": row["beta_version"]})
+        else:
+            return web.json_response({"stable": "1.0.0", "beta": "1.1.0-beta"})
+    finally:
+        await conn.close()
+
+async def admin_set_version_handler(request):
+    data = await request.json()
+    admin_id = data.get("admin_id")
+    if not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    stable = data.get("stable")
+    beta = data.get("beta")
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("UPDATE app_version SET stable_version=$1, beta_version=$2, updated_at=NOW()", stable, beta)
+    finally:
+        await conn.close()
+    return web.json_response({"status": "ok"})
+
 # ---------- WEBSOCKET ----------
 async def ws_handler(request):
     ws = web.WebSocketResponse()
@@ -539,6 +579,8 @@ async def init_app():
     app.router.add_get("/admin/users", admin_users_handler)
     app.router.add_post("/admin/update-user", admin_update_user_handler)
     app.router.add_post("/admin/set-subscription-days", admin_set_subscription_handler)
+    app.router.add_get("/app-version", get_version_handler)
+    app.router.add_post("/admin/set-version", admin_set_version_handler)
     app.router.add_get("/ws", ws_handler)
     return app
 
