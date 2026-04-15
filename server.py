@@ -3,6 +3,7 @@ import asyncio
 import sys
 import time
 import json
+import re
 from datetime import datetime, timedelta
 from aiohttp import web
 import aiohttp
@@ -29,7 +30,6 @@ if not DATABASE_URL:
 connected_clients = {}
 
 def json_serializable(obj):
-    """Рекурсивно преобразует datetime в строку ISO и другие несериализуемые типы."""
     if isinstance(obj, datetime):
         return obj.isoformat()
     if isinstance(obj, dict):
@@ -162,6 +162,14 @@ async def register_handler(request):
     full_name = data["full_name"]
     phone = data["phone"]
 
+    # Валидация
+    if not re.match(r'^[a-zA-Z0-9_]{3,20}$', username):
+        return web.json_response({"error": "Username must be 3-20 letters, digits or underscore"}, status=400)
+    if not full_name.strip():
+        return web.json_response({"error": "Full name required"}, status=400)
+    if not re.match(r'^\+?\d{5,15}$', phone):
+        return web.json_response({"error": "Invalid phone number"}, status=400)
+
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         if await conn.fetchval("SELECT 1 FROM users WHERE username=$1", username):
@@ -187,6 +195,113 @@ async def register_handler(request):
             "is_admin": is_admin_flag
         }
     })
+
+# ---------- ПРОФИЛЬ ----------
+async def update_profile_handler(request):
+    data = await request.json()
+    user_id = data.get("user_id")
+    full_name = data.get("full_name")
+    username = data.get("username")
+    phone = data.get("phone")
+
+    if not user_id:
+        return web.json_response({"error": "Missing user_id"}, status=400)
+
+    # Валидация
+    if username and not re.match(r'^[a-zA-Z0-9_]{3,20}$', username):
+        return web.json_response({"error": "Invalid username"}, status=400)
+    if full_name is not None and not full_name.strip():
+        return web.json_response({"error": "Full name required"}, status=400)
+    if phone and not re.match(r'^\+?\d{5,15}$', phone):
+        return web.json_response({"error": "Invalid phone number"}, status=400)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        if username:
+            # Проверка уникальности
+            existing = await conn.fetchval("SELECT id FROM users WHERE username=$1 AND id!=$2", username, user_id)
+            if existing:
+                return web.json_response({"error": "Username already taken"}, status=400)
+        if phone:
+            existing = await conn.fetchval("SELECT id FROM users WHERE phone=$1 AND id!=$2", phone, user_id)
+            if existing:
+                return web.json_response({"error": "Phone already taken"}, status=400)
+
+        # Формируем запрос
+        updates = []
+        params = []
+        if full_name is not None:
+            updates.append(f"full_name = ${len(params)+1}")
+            params.append(full_name)
+        if username is not None:
+            updates.append(f"username = ${len(params)+1}")
+            params.append(username)
+        if phone is not None:
+            updates.append(f"phone = ${len(params)+1}")
+            params.append(phone)
+        params.append(user_id)
+
+        if updates:
+            query = f"UPDATE users SET {', '.join(updates)} WHERE id = ${len(params)}"
+            await conn.execute(query, *params)
+    finally:
+        await conn.close()
+
+    return web.json_response({"status": "ok", "message": "Profile updated"})
+
+# ---------- АДМИН: ПОЛУЧЕНИЕ СПИСКА ПОЛЬЗОВАТЕЛЕЙ ----------
+async def admin_users_handler(request):
+    admin_id = request.query.get("admin_id")
+    if not admin_id or not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("SELECT id, username, full_name, phone FROM users ORDER BY id")
+        users = [dict(r) for r in rows]
+    finally:
+        await conn.close()
+    return web.json_response({"users": users})
+
+# ---------- АДМИН: РЕДАКТИРОВАНИЕ ПОЛЬЗОВАТЕЛЯ ----------
+async def admin_edit_user_handler(request):
+    data = await request.json()
+    admin_id = data.get("admin_id")
+    target_id = data.get("target_id")
+    field = data.get("field")
+    value = data.get("value")
+
+    if not admin_id or not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+
+    if field not in ["phone", "full_name", "username"]:
+        return web.json_response({"error": "Invalid field"}, status=400)
+
+    # Валидация
+    if field == "phone" and not re.match(r'^\+?\d{5,15}$', value):
+        return web.json_response({"error": "Invalid phone number"}, status=400)
+    if field == "username" and not re.match(r'^[a-zA-Z0-9_]{3,20}$', value):
+        return web.json_response({"error": "Invalid username"}, status=400)
+    if field == "full_name" and not value.strip():
+        return web.json_response({"error": "Full name required"}, status=400)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        # Проверка уникальности для username/phone
+        if field == "username":
+            existing = await conn.fetchval("SELECT id FROM users WHERE username=$1 AND id!=$2", value, target_id)
+            if existing:
+                return web.json_response({"error": "Username already taken"}, status=400)
+        if field == "phone":
+            existing = await conn.fetchval("SELECT id FROM users WHERE phone=$1 AND id!=$2", value, target_id)
+            if existing:
+                return web.json_response({"error": "Phone already taken"}, status=400)
+
+        await conn.execute(f"UPDATE users SET {field}=$1 WHERE id=$2", value, target_id)
+    finally:
+        await conn.close()
+
+    return web.json_response({"status": "ok"})
 
 # ---------- ПОДПИСКИ ----------
 async def create_payment_handler(request):
@@ -244,7 +359,7 @@ async def subscription_status_handler(request):
         })
     return web.json_response({"active": False})
 
-# ---------- АДМИН ----------
+# ---------- АДМИН: АКТИВАЦИЯ ПОДПИСКИ ----------
 async def admin_activate_subscription(request):
     data = await request.json()
     admin_id = data.get("admin_id")
@@ -288,7 +403,7 @@ async def get_profile_handler(request):
         return web.json_response({"error": "Missing user_id"}, status=400)
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        user = await conn.fetchrow("SELECT id, username, full_name, name_color, badge_url, is_admin FROM users WHERE id=$1", int(user_id))
+        user = await conn.fetchrow("SELECT id, username, full_name, name_color, badge_url, is_admin, phone FROM users WHERE id=$1", int(user_id))
     finally:
         await conn.close()
     if user:
@@ -325,6 +440,7 @@ async def ws_handler(request):
     uid = data["user_id"]
     connected_clients[uid] = ws
     print(f"[WS] {uid} connected")
+
     try:
         async for msg in ws:
             data = json.loads(msg.data)
@@ -346,18 +462,23 @@ async def ws_handler(request):
                     except:
                         pass
             elif data["action"] == "delete":
-                msg_id = data.get("message_id")
-                if msg_id:
+                message_id = data.get("message_id")
+                if message_id:
                     conn = await asyncpg.connect(DATABASE_URL)
                     try:
-                        await conn.execute("UPDATE messages SET is_deleted=TRUE WHERE id=$1 AND sender_id=$2", msg_id, uid)
+                        result = await conn.execute(
+                            "UPDATE messages SET is_deleted = TRUE WHERE id = $1 AND sender_id = $2",
+                            message_id, uid
+                        )
+                        # result like "UPDATE 1" or "UPDATE 0"
+                        if result == "UPDATE 1":
+                            for client in connected_clients.values():
+                                try:
+                                    await client.send_json({"type": "delete_message", "message_id": message_id})
+                                except:
+                                    pass
                     finally:
                         await conn.close()
-                    for client in connected_clients.values():
-                        try:
-                            await client.send_json({"type": "delete_message", "message_id": msg_id})
-                        except:
-                            pass
     finally:
         connected_clients.pop(uid, None)
         print(f"[WS] {uid} disconnected")
@@ -400,6 +521,9 @@ async def init_app():
     app = web.Application()
     app.router.add_post("/auth/yandex", auth_handler)
     app.router.add_post("/auth/register", register_handler)
+    app.router.add_post("/update-profile", update_profile_handler)
+    app.router.add_get("/admin/users", admin_users_handler)
+    app.router.add_post("/admin/edit-user", admin_edit_user_handler)
     app.router.add_post("/create-payment", create_payment_handler)
     app.router.add_post("/yoomoney-webhook", yoomoney_webhook)
     app.router.add_get("/subscription-status", subscription_status_handler)
