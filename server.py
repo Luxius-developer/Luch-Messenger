@@ -28,6 +28,16 @@ if not DATABASE_URL:
 
 connected_clients = {}
 
+def json_serializable(obj):
+    """Рекурсивно преобразует datetime в строку ISO и другие несериализуемые типы."""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [json_serializable(i) for i in obj]
+    return obj
+
 async def init_db():
     print("🔧 Инициализация базы данных...")
     conn = await asyncpg.connect(DATABASE_URL)
@@ -133,7 +143,9 @@ async def auth_handler(request):
     await conn.close()
 
     if user:
-        return web.json_response({"status": "ok", "jwt": "test", "user": dict(user)})
+        user_dict = dict(user)
+        user_dict = json_serializable(user_dict)
+        return web.json_response({"status": "ok", "jwt": "test", "user": user_dict})
     else:
         full_name = f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip()
         return web.json_response({
@@ -163,7 +175,18 @@ async def register_handler(request):
         )
     finally:
         await conn.close()
-    return web.json_response({"status": "ok", "jwt": "test", "user": {"id": user_id, **data}})
+
+    return web.json_response({
+        "status": "ok",
+        "jwt": "test",
+        "user": {
+            "id": user_id,
+            "username": username,
+            "full_name": full_name,
+            "phone": phone,
+            "is_admin": is_admin_flag
+        }
+    })
 
 # ---------- ПОДПИСКИ ----------
 async def create_payment_handler(request):
@@ -213,7 +236,12 @@ async def subscription_status_handler(request):
         await conn.close()
     if sub:
         days_left = (sub['end_date'] - datetime.now()).days
-        return web.json_response({"active": True, "plan": sub['plan_type'], "days_left": days_left, "expires": sub['end_date'].isoformat()})
+        return web.json_response({
+            "active": True,
+            "plan": sub['plan_type'],
+            "days_left": days_left,
+            "expires": sub['end_date'].isoformat()
+        })
     return web.json_response({"active": False})
 
 # ---------- АДМИН ----------
@@ -264,7 +292,9 @@ async def get_profile_handler(request):
     finally:
         await conn.close()
     if user:
-        return web.json_response(dict(user))
+        user_dict = dict(user)
+        user_dict = json_serializable(user_dict)
+        return web.json_response(user_dict)
     return web.json_response({"error": "User not found"}, status=404)
 
 # ---------- ПОИСК ----------
@@ -308,9 +338,11 @@ async def ws_handler(request):
                     sender = await conn.fetchrow("SELECT id, username, full_name, name_color, badge_url FROM users WHERE id=$1", uid)
                 finally:
                     await conn.close()
+                sender_dict = dict(sender) if sender else {}
+                sender_dict = json_serializable(sender_dict)
                 for client in connected_clients.values():
                     try:
-                        await client.send_json({"type": "new_message", "message": {"id": msg_id, "text": text, "sender": dict(sender)}})
+                        await client.send_json({"type": "new_message", "message": {"id": msg_id, "text": text, "sender": sender_dict}})
                     except:
                         pass
             elif data["action"] == "delete":
@@ -343,18 +375,21 @@ async def messages_handler(request):
             WHERE m.is_deleted=FALSE
             ORDER BY m.created_at DESC LIMIT 50
         ''')
-        messages = [{
-            "id": r["id"],
-            "text": r["text"],
-            "created_at": r["created_at"].isoformat(),
-            "sender": {
-                "id": r["uid"],
-                "username": r["username"],
-                "full_name": r["full_name"],
-                "name_color": r["name_color"],
-                "badge_url": r["badge_url"]
+        messages = []
+        for r in reversed(rows):
+            msg = {
+                "id": r["id"],
+                "text": r["text"],
+                "created_at": r["created_at"].isoformat(),
+                "sender": {
+                    "id": r["uid"],
+                    "username": r["username"],
+                    "full_name": r["full_name"],
+                    "name_color": r["name_color"],
+                    "badge_url": r["badge_url"]
+                }
             }
-        } for r in reversed(rows)]
+            messages.append(msg)
     finally:
         await conn.close()
     return web.json_response(messages)
