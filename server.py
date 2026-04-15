@@ -26,7 +26,7 @@ if not DATABASE_URL:
     sys.exit(1)
 # ========================================
 
-connected_clients = {}  # user_id -> websocket
+connected_clients = {}
 
 def json_serializable(obj):
     if isinstance(obj, datetime):
@@ -40,8 +40,6 @@ def json_serializable(obj):
 async def init_db():
     print("🔧 Инициализация базы данных...")
     conn = await asyncpg.connect(DATABASE_URL)
-    
-    # Таблица users
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -56,8 +54,6 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    
-    # Таблица messages с recipient_id (NULL = общий чат)
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
@@ -68,18 +64,11 @@ async def init_db():
             is_deleted BOOLEAN DEFAULT FALSE
         )
     ''')
-    
-    # Добавляем колонку recipient_id, если она отсутствует (для старых таблиц)
     try:
         await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE")
-        print("✅ Колонка recipient_id добавлена (если отсутствовала)")
+        await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
     except Exception as e:
-        print(f"⚠️ Не удалось добавить колонку recipient_id: {e}")
-    
-    # Добавляем индекс для ускорения
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
-    
-    # Таблица subscriptions
+        print(f"⚠️ Колонка recipient_id уже есть: {e}")
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
             id SERIAL PRIMARY KEY,
@@ -91,8 +80,6 @@ async def init_db():
             auto_renew BOOLEAN DEFAULT FALSE
         )
     ''')
-    
-    # Таблица pending_payments
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS pending_payments (
             id SERIAL PRIMARY KEY,
@@ -104,7 +91,6 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    
     await conn.close()
     print("✅ База данных готова")
 
@@ -209,10 +195,10 @@ async def register_handler(request):
         }
     })
 
-# ---------- ПОИСК ПОЛЬЗОВАТЕЛЕЙ ----------
+# ---------- ПОИСК ПОЛЬЗОВАТЕЛЕЙ (1 символ) ----------
 async def search_users_handler(request):
     query = request.query.get("q", "").strip()
-    if len(query) < 2:
+    if len(query) < 1:   # исправлено: можно искать по одному символу
         return web.json_response({"users": []})
     conn = await asyncpg.connect(DATABASE_URL)
     try:
@@ -249,7 +235,7 @@ async def chats_handler(request):
         await conn.close()
     return web.json_response({"chats": chats})
 
-# ---------- ИСТОРИЯ СООБЩЕНИЙ ДЛЯ ЧАТА ----------
+# ---------- ИСТОРИЯ СООБЩЕНИЙ ----------
 async def messages_handler(request):
     token = request.query.get("token")
     if token != "test":
@@ -261,7 +247,6 @@ async def messages_handler(request):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         if recipient_id:
-            # Личный чат
             rows = await conn.fetch("""
                 SELECT m.id, m.text, m.created_at,
                        u.id as uid, u.username, u.full_name, u.name_color, u.badge_url
@@ -272,7 +257,6 @@ async def messages_handler(request):
                 ORDER BY m.created_at DESC LIMIT 50
             """, int(user_id), int(recipient_id))
         else:
-            # Общий чат
             rows = await conn.fetch("""
                 SELECT m.id, m.text, m.created_at,
                        u.id as uid, u.username, u.full_name, u.name_color, u.badge_url
@@ -298,6 +282,58 @@ async def messages_handler(request):
     finally:
         await conn.close()
     return web.json_response(messages)
+
+# ---------- ПРОФИЛЬ И РЕДАКТИРОВАНИЕ ----------
+async def profile_handler(request):
+    user_id = request.query.get("user_id")
+    if not user_id:
+        return web.json_response({"error": "Missing user_id"}, status=400)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        user = await conn.fetchrow(
+            "SELECT id, username, full_name, phone, name_color, badge_url, is_admin, created_at FROM users WHERE id=$1",
+            int(user_id)
+        )
+        if not user:
+            return web.json_response({"error": "User not found"}, status=404)
+        user_dict = dict(user)
+        user_dict = json_serializable(user_dict)
+    finally:
+        await conn.close()
+    return web.json_response(user_dict)
+
+async def update_profile_handler(request):
+    data = await request.json()
+    user_id = data.get("user_id")
+    new_username = data.get("username")
+    new_full_name = data.get("full_name")
+    if not user_id:
+        return web.json_response({"error": "Missing user_id"}, status=400)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        if new_username:
+            existing = await conn.fetchval("SELECT 1 FROM users WHERE username=$1 AND id!=$2", new_username, user_id)
+            if existing:
+                return web.json_response({"error": "Username already taken"}, status=400)
+            await conn.execute("UPDATE users SET username=$1 WHERE id=$2", new_username, user_id)
+        if new_full_name:
+            await conn.execute("UPDATE users SET full_name=$1 WHERE id=$2", new_full_name, user_id)
+    finally:
+        await conn.close()
+    return web.json_response({"status": "ok"})
+
+async def set_color_handler(request):
+    data = await request.json()
+    user_id = data.get("user_id")
+    color = data.get("color")
+    if not await check_subscription(user_id):
+        return web.json_response({"error": "Subscription required"}, status=403)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("UPDATE users SET name_color=$1 WHERE id=$2", color, user_id)
+    finally:
+        await conn.close()
+    return web.json_response({"status": "ok", "color": color})
 
 # ---------- ПОДПИСКИ ----------
 async def create_payment_handler(request):
@@ -380,6 +416,34 @@ async def admin_update_user_handler(request):
         await conn.close()
     return web.json_response({"status": "ok"})
 
+async def admin_set_subscription_handler(request):
+    data = await request.json()
+    admin_id = data.get("admin_id")
+    if not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    target_user_id = data.get("user_id")
+    days = data.get("days")
+    if not target_user_id or days is None:
+        return web.json_response({"error": "Missing user_id or days"}, status=400)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        sub = await conn.fetchrow(
+            "SELECT id, end_date FROM subscriptions WHERE user_id=$1 AND status='active' AND end_date > NOW() ORDER BY end_date DESC LIMIT 1",
+            target_user_id
+        )
+        if sub:
+            new_end = sub['end_date'] + timedelta(days=days)
+            await conn.execute("UPDATE subscriptions SET end_date=$1 WHERE id=$2", new_end, sub['id'])
+        else:
+            new_end = datetime.now() + timedelta(days=days)
+            await conn.execute(
+                "INSERT INTO subscriptions (user_id, plan_type, end_date, status) VALUES ($1, 'admin', $2, 'active')",
+                target_user_id, new_end
+            )
+    finally:
+        await conn.close()
+    return web.json_response({"status": "ok", "new_end_date": new_end.isoformat()})
+
 # ---------- WEBSOCKET ----------
 async def ws_handler(request):
     ws = web.WebSocketResponse()
@@ -401,7 +465,7 @@ async def ws_handler(request):
             data = json.loads(msg.data)
             if data["action"] == "send":
                 text = data.get("text")
-                recipient_id = data.get("recipient_id")  # может быть None (общий чат)
+                recipient_id = data.get("recipient_id")
                 if not text:
                     continue
                 conn = await asyncpg.connect(DATABASE_URL)
@@ -418,12 +482,9 @@ async def ws_handler(request):
                     await conn.close()
                 sender_dict = dict(sender) if sender else {}
                 sender_dict = json_serializable(sender_dict)
-                # Рассылка
                 if recipient_id:
-                    # Личное сообщение – только отправителю и получателю
                     targets = [uid, recipient_id]
                 else:
-                    # Общий чат – всем активным
                     targets = connected_clients.keys()
                 for client_id in targets:
                     client = connected_clients.get(client_id)
@@ -469,11 +530,15 @@ async def init_app():
     app.router.add_get("/search-users", search_users_handler)
     app.router.add_get("/chats", chats_handler)
     app.router.add_get("/messages", messages_handler)
+    app.router.add_get("/profile", profile_handler)
+    app.router.add_post("/update-profile", update_profile_handler)
+    app.router.add_post("/set-color", set_color_handler)
     app.router.add_post("/create-payment", create_payment_handler)
     app.router.add_post("/yoomoney-webhook", yoomoney_webhook)
     app.router.add_get("/subscription-status", subscription_status_handler)
     app.router.add_get("/admin/users", admin_users_handler)
     app.router.add_post("/admin/update-user", admin_update_user_handler)
+    app.router.add_post("/admin/set-subscription-days", admin_set_subscription_handler)
     app.router.add_get("/ws", ws_handler)
     return app
 
