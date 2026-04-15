@@ -12,7 +12,7 @@ from yoomoney import Quickpay
 # ============= КОНФИГУРАЦИЯ =============
 YANDEX_CLIENT_ID = "102bb468a84f4d62a52520f715aea194"
 YANDEX_CLIENT_SECRET = "a2e48310b6404262bb9d37c1a2405039"
-BASE_URL = os.environ.get("BASE_URL", "https://luch-messenger.up.railway.app")
+BASE_URL = os.environ.get("BASE_URL", "https://luch-messenger-production.up.railway.app")
 REDIRECT_URI = f"{BASE_URL}/auth/yandex/callback"
 
 YOOMONEY_RECEIVER = "4100118812633088"
