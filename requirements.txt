@@ -4,3 +4,6 @@ asyncpg==0.29.0
 yoomoney==0.1.2
 requests==2.31.0
 websockets==12.0
+PyQt5==5.15.10
+PyQtWebEngine==5.15.6
+qasync==0.27.1
