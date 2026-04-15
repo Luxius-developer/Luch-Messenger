@@ -40,6 +40,7 @@ def json_serializable(obj):
 async def init_db():
     print("🔧 Инициализация базы данных...")
     conn = await asyncpg.connect(DATABASE_URL)
+    
     # Таблица users
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -55,6 +56,7 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
+    
     # Таблица messages с recipient_id (NULL = общий чат)
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
@@ -66,6 +68,17 @@ async def init_db():
             is_deleted BOOLEAN DEFAULT FALSE
         )
     ''')
+    
+    # Добавляем колонку recipient_id, если она отсутствует (для старых таблиц)
+    try:
+        await conn.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE")
+        print("✅ Колонка recipient_id добавлена (если отсутствовала)")
+    except Exception as e:
+        print(f"⚠️ Не удалось добавить колонку recipient_id: {e}")
+    
+    # Добавляем индекс для ускорения
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
+    
     # Таблица subscriptions
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
@@ -78,6 +91,7 @@ async def init_db():
             auto_renew BOOLEAN DEFAULT FALSE
         )
     ''')
+    
     # Таблица pending_payments
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS pending_payments (
@@ -90,6 +104,7 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
+    
     await conn.close()
     print("✅ База данных готова")
 
@@ -164,7 +179,7 @@ async def register_handler(request):
     yandex_id = data["yandex_id"]
     username = data["username"]
     full_name = data["full_name"]
-    phone = data.get("phone", None)  # может быть пустым
+    phone = data.get("phone", None)
 
     conn = await asyncpg.connect(DATABASE_URL)
     try:
@@ -201,7 +216,6 @@ async def search_users_handler(request):
         return web.json_response({"users": []})
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        # Поиск по id (если строка состоит из цифр), username, full_name
         if query.isdigit():
             rows = await conn.fetch(
                 "SELECT id, username, full_name FROM users WHERE id = $1 OR username ILIKE $2 OR full_name ILIKE $2 LIMIT 20",
@@ -224,7 +238,6 @@ async def chats_handler(request):
         return web.json_response({"error": "No user_id"}, status=400)
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        # Все пользователи, с которыми есть личные сообщения (входящие или исходящие)
         rows = await conn.fetch("""
             SELECT DISTINCT u.id, u.username, u.full_name
             FROM messages m
@@ -437,7 +450,6 @@ async def ws_handler(request):
                         )
                     finally:
                         await conn.close()
-                    # Уведомляем всех (общий чат) или только участников – для простоты уведомляем всех
                     for client in connected_clients.values():
                         try:
                             await client.send_json({"type": "delete_message", "message_id": message_id})
