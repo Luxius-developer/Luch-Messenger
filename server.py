@@ -4,7 +4,6 @@ import sys
 import time
 import json
 import hashlib
-import shutil
 import uuid
 import mimetypes
 from datetime import datetime, timedelta
@@ -30,14 +29,11 @@ if not DATABASE_URL:
     print("❌ DATABASE_URL не задан!")
     sys.exit(1)
 
-# Настройки файлов
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_FILE_SIZE = 50 * 1024 * 1024
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 FILE_RETENTION_DAYS = 30
-REPUTATION_THRESHOLD = 3  # жалоб для автоматической блокировки
-
-# VirusTotal (опционально)
+REPUTATION_THRESHOLD = 3
 VIRUSTOTAL_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY", "")
 # ========================================
 
@@ -55,6 +51,7 @@ def json_serializable(obj):
 async def init_db():
     print("🔧 Инициализация базы данных...")
     conn = await asyncpg.connect(DATABASE_URL)
+
     # Таблица users
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
@@ -72,13 +69,14 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    # Таблица messages (с поддержкой файлов)
+
+    # Таблица messages (с групповыми чатами и файлами)
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
             sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            group_id INTEGER DEFAULT NULL,
+            group_id INTEGER,
             text TEXT,
             file_url TEXT,
             file_name TEXT,
@@ -89,7 +87,19 @@ async def init_db():
             is_deleted BOOLEAN DEFAULT FALSE
         )
     ''')
-    # Таблица subscriptions
+
+    # Добавляем недостающие колонки, если таблица уже существовала
+    for col in ['group_id', 'file_hash', 'file_url', 'file_name', 'file_size', 'file_type']:
+        try:
+            await conn.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} TEXT")
+        except:
+            pass
+
+    # Индексы
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)")
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
+
+    # Таблица подписок
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
             id SERIAL PRIMARY KEY,
@@ -101,7 +111,8 @@ async def init_db():
             auto_renew BOOLEAN DEFAULT FALSE
         )
     ''')
-    # Таблица pending_payments
+
+    # Таблица временных платежей
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS pending_payments (
             id SERIAL PRIMARY KEY,
@@ -113,7 +124,8 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    # Таблица app_version
+
+    # Таблица версий приложения
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS app_version (
             id SERIAL PRIMARY KEY,
@@ -122,19 +134,24 @@ async def init_db():
             updated_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    # Таблица file_reputation
+    row = await conn.fetchval("SELECT COUNT(*) FROM app_version")
+    if row == 0:
+        await conn.execute("INSERT INTO app_version (stable_version, beta_version) VALUES ('1.0.0', '1.1.0-beta')")
+
+    # Таблица репутации файлов
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS file_reputation (
             id SERIAL PRIMARY KEY,
             file_hash TEXT UNIQUE NOT NULL,
-            status TEXT DEFAULT 'unknown', -- 'safe', 'dangerous', 'unknown'
+            status TEXT DEFAULT 'unknown',
             vt_report TEXT DEFAULT NULL,
             complaints INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT NOW(),
             updated_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    # Таблица жалоб на файлы (для модерации)
+
+    # Таблица жалоб на файлы
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS file_complaints (
             id SERIAL PRIMARY KEY,
@@ -144,6 +161,7 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
+
     # Таблица событий безопасности (лента)
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS security_events (
@@ -155,15 +173,7 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    # Индексы
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
-    await conn.execute("CREATE INDEX IF NOT EXISTS idx_file_reputation_hash ON file_reputation(file_hash)")
 
-    # Начальные версии
-    row = await conn.fetchval("SELECT COUNT(*) FROM app_version")
-    if row == 0:
-        await conn.execute("INSERT INTO app_version (stable_version, beta_version) VALUES ('1.0.0', '1.1.0-beta')")
     await conn.close()
     print("✅ База данных готова")
 
@@ -217,13 +227,10 @@ async def add_complaint(file_hash, user_id, reason):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         await conn.execute("INSERT INTO file_complaints (file_hash, user_id, reason) VALUES ($1,$2,$3)", file_hash, user_id, reason)
-        # Увеличиваем счётчик жалоб
         await conn.execute("UPDATE file_reputation SET complaints = complaints + 1, updated_at=NOW() WHERE file_hash=$1", file_hash)
-        # Проверяем порог
         row = await conn.fetchrow("SELECT complaints FROM file_reputation WHERE file_hash=$1", file_hash)
         if row and row["complaints"] >= REPUTATION_THRESHOLD:
             await conn.execute("UPDATE file_reputation SET status='dangerous' WHERE file_hash=$1", file_hash)
-            # Добавляем событие безопасности
             await conn.execute("INSERT INTO security_events (event_type, file_hash, message) VALUES ('auto_blocked', $1, $2)", file_hash, f"Файл заблокирован автоматически после {REPUTATION_THRESHOLD} жалоб")
     finally:
         await conn.close()
@@ -239,9 +246,8 @@ async def add_security_event(event_type, file_hash, file_name, message):
         await conn.close()
 
 async def clean_old_files():
-    """Удаляет файлы старше FILE_RETENTION_DAYS дней и соответствующие записи в БД"""
     while True:
-        await asyncio.sleep(86400)  # раз в сутки
+        await asyncio.sleep(86400)
         try:
             conn = await asyncpg.connect(DATABASE_URL)
             rows = await conn.fetch("SELECT id, file_url FROM messages WHERE file_url IS NOT NULL AND created_at < NOW() - INTERVAL '30 days'")
@@ -336,7 +342,6 @@ async def register_handler(request):
         }
     })
 
-# ---------- Поиск пользователей ----------
 async def search_users_handler(request):
     query = request.query.get("q", "").strip()
     if len(query) < 1:
@@ -358,7 +363,6 @@ async def search_users_handler(request):
         await conn.close()
     return web.json_response({"users": users})
 
-# ---------- Список чатов ----------
 async def chats_handler(request):
     user_id = request.query.get("user_id")
     if not user_id:
@@ -376,193 +380,75 @@ async def chats_handler(request):
         await conn.close()
     return web.json_response({"chats": chats})
 
-# ---------- Загрузка файлов ----------
-async def upload_handler(request):
-    data = await request.post()
-    user_id = int(data.get("user_id", 0))
-    token = data.get("token")
-    if token != "test":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    # Проверяем существование пользователя
-    conn = await asyncpg.connect(DATABASE_URL)
-    user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
-    await conn.close()
-    if not user:
-        return web.json_response({"error": "Invalid user"}, status=403)
-
-    if "file" not in data:
-        return web.json_response({"error": "No file"}, status=400)
-    file = data["file"]
-    file_data = file.file
-    original_filename = file.filename
-    file_size = len(file_data.read())
-    file_data.seek(0)
-    if file_size > MAX_FILE_SIZE:
-        return web.json_response({"error": "File too large"}, status=400)
-
-    # Вычисляем хеш файла
-    file_hash = hashlib.sha256(file_data.read()).hexdigest()
-    file_data.seek(0)
-
-    # Проверяем репутацию
-    rep = await get_file_reputation(file_hash)
-    if rep and rep["status"] == "dangerous":
-        return web.json_response({"error": "This file is blocked due to security reasons"}, status=403)
-
-    # Генерируем уникальное имя
-    ext = os.path.splitext(original_filename)[1]
-    unique_name = f"{uuid.uuid4().hex}{ext}"
-    save_path = os.path.join(UPLOAD_FOLDER, unique_name)
-    async with aiofiles.open(save_path, "wb") as f:
-        await f.write(file_data.read())
-
-    # Определяем MIME-тип
-    mime_type, _ = mimetypes.guess_type(original_filename)
-    if not mime_type:
-        mime_type = "application/octet-stream"
-
-    file_url = f"/uploads/{unique_name}"
-    # Сохраняем информацию о файле в отдельной таблице? Пока просто вернём данные
-    return web.json_response({
-        "file_url": file_url,
-        "file_name": original_filename,
-        "file_size": file_size,
-        "file_type": mime_type,
-        "file_hash": file_hash
-    })
-
-# ---------- Скачивание файлов (с проверкой прав доступа) ----------
-async def download_handler(request):
-    filename = request.match_info['filename']
-    # Проверяем, имеет ли пользователь доступ к файлу (через сообщение)
+async def messages_handler(request):
     token = request.query.get("token")
     if token != "test":
-        return web.json_response({"error": "Unauthorized"}, status=401)
+        return web.json_response({"error": "Unauth"}, status=401)
     user_id = request.query.get("user_id")
+    recipient_id = request.query.get("recipient_id")
+    group_id = request.query.get("group_id")
     if not user_id:
-        return web.json_response({"error": "Missing user_id"}, status=400)
+        return web.json_response({"error": "No user_id"}, status=400)
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        # Ищем сообщение с таким file_url
-        file_url = f"/uploads/{filename}"
-        msg = await conn.fetchrow("SELECT sender_id, recipient_id, group_id FROM messages WHERE file_url=$1", file_url)
-        if not msg:
-            return web.json_response({"error": "File not found"}, status=404)
-        # Проверяем, что пользователь является участником диалога (отправитель или получатель)
-        if msg["group_id"] is not None:
-            # Групповой чат – проверяем членство
-            member = await conn.fetchval("SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2", msg["group_id"], int(user_id))
-            if not member:
-                return web.json_response({"error": "Access denied"}, status=403)
+        if recipient_id:
+            rows = await conn.fetch("""
+                SELECT m.id, m.text, m.created_at,
+                       u.id as uid, u.username, u.full_name, u.name_color, u.badge_url,
+                       m.file_url, m.file_name, m.file_size, m.file_type, m.file_hash
+                FROM messages m
+                JOIN users u ON m.sender_id = u.id
+                WHERE ((m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1))
+                  AND m.is_deleted = FALSE
+                ORDER BY m.created_at DESC LIMIT 50
+            """, int(user_id), int(recipient_id))
+        elif group_id:
+            rows = await conn.fetch("""
+                SELECT m.id, m.text, m.created_at,
+                       u.id as uid, u.username, u.full_name, u.name_color, u.badge_url,
+                       m.file_url, m.file_name, m.file_size, m.file_type, m.file_hash
+                FROM messages m
+                JOIN users u ON m.sender_id = u.id
+                WHERE m.group_id = $1 AND m.is_deleted = FALSE
+                ORDER BY m.created_at DESC LIMIT 50
+            """, int(group_id))
         else:
-            if msg["recipient_id"] is not None:
-                if int(user_id) not in (msg["sender_id"], msg["recipient_id"]):
-                    return web.json_response({"error": "Access denied"}, status=403)
-            else:
-                # Общий чат – доступ всем
-                pass
+            rows = await conn.fetch("""
+                SELECT m.id, m.text, m.created_at,
+                       u.id as uid, u.username, u.full_name, u.name_color, u.badge_url,
+                       m.file_url, m.file_name, m.file_size, m.file_type, m.file_hash
+                FROM messages m
+                JOIN users u ON m.sender_id = u.id
+                WHERE m.recipient_id IS NULL AND m.group_id IS NULL AND m.is_deleted = FALSE
+                ORDER BY m.created_at DESC LIMIT 50
+            """)
+        messages = []
+        for r in reversed(rows):
+            msg = {
+                "id": r["id"],
+                "text": r["text"],
+                "created_at": r["created_at"].isoformat(),
+                "sender": {
+                    "id": r["uid"],
+                    "username": r["username"],
+                    "full_name": r["full_name"],
+                    "name_color": r["name_color"],
+                    "badge_url": r["badge_url"]
+                }
+            }
+            if r["file_url"]:
+                msg["file_info"] = {
+                    "file_url": r["file_url"],
+                    "file_name": r["file_name"],
+                    "file_size": r["file_size"],
+                    "file_type": r["file_type"],
+                    "file_hash": r["file_hash"]
+                }
+            messages.append(msg)
     finally:
         await conn.close()
+    return web.json_response(messages)
 
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-    if not os.path.exists(file_path):
-        return web.json_response({"error": "File not found on disk"}, status=404)
-    return web.FileResponse(file_path)
-
-# ---------- Проверка репутации файла по хешу ----------
-async def check_file_reputation_handler(request):
-    data = await request.json()
-    file_hash = data.get("file_hash")
-    if not file_hash:
-        return web.json_response({"error": "No file_hash"}, status=400)
-    rep = await get_file_reputation(file_hash)
-    if rep:
-        return web.json_response(rep)
-    else:
-        return web.json_response({"status": "unknown", "complaints": 0})
-
-# ---------- Жалоба на файл ----------
-async def complain_file_handler(request):
-    data = await request.json()
-    user_id = data.get("user_id")
-    file_hash = data.get("file_hash")
-    reason = data.get("reason", "")
-    token = data.get("token")
-    if token != "test":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    if not user_id or not file_hash:
-        return web.json_response({"error": "Missing parameters"}, status=400)
-    await add_complaint(file_hash, user_id, reason)
-    return web.json_response({"status": "ok"})
-
-# ---------- Админ: получение жалоб ----------
-async def admin_complaints_handler(request):
-    admin_id = request.query.get("admin_id")
-    if not await is_admin(int(admin_id)):
-        return web.json_response({"error": "Forbidden"}, status=403)
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        rows = await conn.fetch("""
-            SELECT fr.file_hash, fr.status, fr.complaints, fc.user_id, fc.reason, fc.created_at
-            FROM file_reputation fr
-            JOIN file_complaints fc ON fr.file_hash = fc.file_hash
-            ORDER BY fc.created_at DESC
-        """)
-        complaints = [dict(r) for r in rows]
-    finally:
-        await conn.close()
-    return web.json_response({"complaints": complaints})
-
-# ---------- Админ: снятие блокировки с файла ----------
-async def admin_unblock_file_handler(request):
-    data = await request.json()
-    admin_id = data.get("admin_id")
-    if not await is_admin(int(admin_id)):
-        return web.json_response({"error": "Forbidden"}, status=403)
-    file_hash = data.get("file_hash")
-    if not file_hash:
-        return web.json_response({"error": "Missing file_hash"}, status=400)
-    await update_file_reputation(file_hash, "safe", 0)
-    # Удаляем жалобы
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        await conn.execute("DELETE FROM file_complaints WHERE file_hash=$1", file_hash)
-        await conn.execute("INSERT INTO security_events (event_type, file_hash, message) VALUES ('admin_unblocked', $1, $2)", file_hash, f"Файл разблокирован администратором")
-    finally:
-        await conn.close()
-    return web.json_response({"status": "ok"})
-
-# ---------- Админ: подтверждение опасности файла ----------
-async def admin_confirm_dangerous_handler(request):
-    data = await request.json()
-    admin_id = data.get("admin_id")
-    if not await is_admin(int(admin_id)):
-        return web.json_response({"error": "Forbidden"}, status=403)
-    file_hash = data.get("file_hash")
-    if not file_hash:
-        return web.json_response({"error": "Missing file_hash"}, status=400)
-    await update_file_reputation(file_hash, "dangerous")
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        await conn.execute("INSERT INTO security_events (event_type, file_hash, message) VALUES ('admin_confirmed', $1, $2)", file_hash, f"Файл подтверждён как опасный администратором")
-    finally:
-        await conn.close()
-    return web.json_response({"status": "ok"})
-
-# ---------- Получение ленты событий безопасности ----------
-async def security_events_handler(request):
-    token = request.query.get("token")
-    if token != "test":
-        return web.json_response({"error": "Unauthorized"}, status=401)
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        rows = await conn.fetch("SELECT event_type, file_hash, file_name, message, created_at FROM security_events ORDER BY created_at DESC LIMIT 50")
-        events = [dict(r) for r in rows]
-    finally:
-        await conn.close()
-    return web.json_response({"events": events})
-
-# ---------- Профиль пользователя ----------
 async def profile_handler(request):
     user_id = request.query.get("user_id")
     if not user_id:
@@ -622,7 +508,6 @@ async def set_color_handler(request):
         await conn.close()
     return web.json_response({"status": "ok", "color": color})
 
-# ---------- Подписки ----------
 async def create_payment_handler(request):
     data = await request.json()
     user_id = data.get("user_id")
@@ -673,7 +558,122 @@ async def subscription_status_handler(request):
         return web.json_response({"active": True, "plan": sub['plan_type'], "days_left": days_left, "expires": sub['end_date'].isoformat()})
     return web.json_response({"active": False})
 
-# ---------- Админка пользователей ----------
+# ---------- Файлы ----------
+async def upload_handler(request):
+    data = await request.post()
+    user_id = int(data.get("user_id", 0))
+    token = data.get("token")
+    if token != "test":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    conn = await asyncpg.connect(DATABASE_URL)
+    user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
+    await conn.close()
+    if not user:
+        return web.json_response({"error": "Invalid user"}, status=403)
+
+    if "file" not in data:
+        return web.json_response({"error": "No file"}, status=400)
+    file = data["file"]
+    file_data = file.file
+    original_filename = file.filename
+    file_size = len(file_data.read())
+    file_data.seek(0)
+    if file_size > MAX_FILE_SIZE:
+        return web.json_response({"error": "File too large"}, status=400)
+
+    file_hash = hashlib.sha256(file_data.read()).hexdigest()
+    file_data.seek(0)
+
+    rep = await get_file_reputation(file_hash)
+    if rep and rep["status"] == "dangerous":
+        return web.json_response({"error": "This file is blocked due to security reasons"}, status=403)
+
+    ext = os.path.splitext(original_filename)[1]
+    unique_name = f"{uuid.uuid4().hex}{ext}"
+    save_path = os.path.join(UPLOAD_FOLDER, unique_name)
+    async with aiofiles.open(save_path, "wb") as f:
+        await f.write(file_data.read())
+
+    mime_type, _ = mimetypes.guess_type(original_filename)
+    if not mime_type:
+        mime_type = "application/octet-stream"
+
+    file_url = f"/uploads/{unique_name}"
+    return web.json_response({
+        "file_url": file_url,
+        "file_name": original_filename,
+        "file_size": file_size,
+        "file_type": mime_type,
+        "file_hash": file_hash
+    })
+
+async def download_handler(request):
+    filename = request.match_info['filename']
+    token = request.query.get("token")
+    if token != "test":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    user_id = request.query.get("user_id")
+    if not user_id:
+        return web.json_response({"error": "Missing user_id"}, status=400)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        file_url = f"/uploads/{filename}"
+        msg = await conn.fetchrow("SELECT sender_id, recipient_id, group_id FROM messages WHERE file_url=$1", file_url)
+        if not msg:
+            return web.json_response({"error": "File not found"}, status=404)
+        if msg["group_id"] is not None:
+            member = await conn.fetchval("SELECT 1 FROM group_members WHERE group_id=$1 AND user_id=$2", msg["group_id"], int(user_id))
+            if not member:
+                return web.json_response({"error": "Access denied"}, status=403)
+        else:
+            if msg["recipient_id"] is not None:
+                if int(user_id) not in (msg["sender_id"], msg["recipient_id"]):
+                    return web.json_response({"error": "Access denied"}, status=403)
+    finally:
+        await conn.close()
+
+    file_path = os.path.join(UPLOAD_FOLDER, filename)
+    if not os.path.exists(file_path):
+        return web.json_response({"error": "File not found on disk"}, status=404)
+    return web.FileResponse(file_path)
+
+async def check_file_reputation_handler(request):
+    data = await request.json()
+    file_hash = data.get("file_hash")
+    if not file_hash:
+        return web.json_response({"error": "No file_hash"}, status=400)
+    rep = await get_file_reputation(file_hash)
+    if rep:
+        return web.json_response(rep)
+    else:
+        return web.json_response({"status": "unknown", "complaints": 0})
+
+async def complain_file_handler(request):
+    data = await request.json()
+    user_id = data.get("user_id")
+    file_hash = data.get("file_hash")
+    reason = data.get("reason", "")
+    token = data.get("token")
+    if token != "test":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    if not user_id or not file_hash:
+        return web.json_response({"error": "Missing parameters"}, status=400)
+    await add_complaint(file_hash, user_id, reason)
+    return web.json_response({"status": "ok"})
+
+async def security_events_handler(request):
+    token = request.query.get("token")
+    if token != "test":
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("SELECT event_type, file_hash, file_name, message, created_at FROM security_events ORDER BY created_at DESC LIMIT 50")
+        events = [dict(r) for r in rows]
+    finally:
+        await conn.close()
+    return web.json_response({"events": events})
+
+# ---------- Админка ----------
 async def admin_users_handler(request):
     admin_id = request.query.get("admin_id")
     if not await is_admin(int(admin_id)):
@@ -716,24 +716,67 @@ async def admin_set_subscription_handler(request):
         return web.json_response({"error": "Missing user_id or days"}, status=400)
     conn = await asyncpg.connect(DATABASE_URL)
     try:
-        sub = await conn.fetchrow(
-            "SELECT id, end_date FROM subscriptions WHERE user_id=$1 AND status='active' AND end_date > NOW() ORDER BY end_date DESC LIMIT 1",
-            target_user_id
-        )
+        sub = await conn.fetchrow("SELECT id, end_date FROM subscriptions WHERE user_id=$1 AND status='active' AND end_date > NOW() ORDER BY end_date DESC LIMIT 1", target_user_id)
         if sub:
             new_end = sub['end_date'] + timedelta(days=days)
             await conn.execute("UPDATE subscriptions SET end_date=$1 WHERE id=$2", new_end, sub['id'])
         else:
             new_end = datetime.now() + timedelta(days=days)
-            await conn.execute(
-                "INSERT INTO subscriptions (user_id, plan_type, end_date, status) VALUES ($1, 'admin', $2, 'active')",
-                target_user_id, new_end
-            )
+            await conn.execute("INSERT INTO subscriptions (user_id, plan_type, end_date, status) VALUES ($1, 'admin', $2, 'active')", target_user_id, new_end)
     finally:
         await conn.close()
     return web.json_response({"status": "ok", "new_end_date": new_end.isoformat()})
 
-# ---------- Версии приложения ----------
+async def admin_complaints_handler(request):
+    admin_id = request.query.get("admin_id")
+    if not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("""
+            SELECT fr.file_hash, fr.status, fr.complaints, fc.user_id, fc.reason, fc.created_at
+            FROM file_reputation fr
+            JOIN file_complaints fc ON fr.file_hash = fc.file_hash
+            ORDER BY fc.created_at DESC
+        """)
+        complaints = [dict(r) for r in rows]
+    finally:
+        await conn.close()
+    return web.json_response({"complaints": complaints})
+
+async def admin_unblock_file_handler(request):
+    data = await request.json()
+    admin_id = data.get("admin_id")
+    if not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    file_hash = data.get("file_hash")
+    if not file_hash:
+        return web.json_response({"error": "Missing file_hash"}, status=400)
+    await update_file_reputation(file_hash, "safe", 0)
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("DELETE FROM file_complaints WHERE file_hash=$1", file_hash)
+        await conn.execute("INSERT INTO security_events (event_type, file_hash, message) VALUES ('admin_unblocked', $1, $2)", file_hash, "Файл разблокирован администратором")
+    finally:
+        await conn.close()
+    return web.json_response({"status": "ok"})
+
+async def admin_confirm_dangerous_handler(request):
+    data = await request.json()
+    admin_id = data.get("admin_id")
+    if not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    file_hash = data.get("file_hash")
+    if not file_hash:
+        return web.json_response({"error": "Missing file_hash"}, status=400)
+    await update_file_reputation(file_hash, "dangerous")
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("INSERT INTO security_events (event_type, file_hash, message) VALUES ('admin_confirmed', $1, $2)", file_hash, "Файл подтверждён как опасный администратором")
+    finally:
+        await conn.close()
+    return web.json_response({"status": "ok"})
+
 async def get_version_handler(request):
     conn = await asyncpg.connect(DATABASE_URL)
     try:
@@ -776,7 +819,7 @@ async def admin_broadcast_handler(request):
             pass
     return web.json_response({"status": "ok"})
 
-# ---------- WebSocket (расширен для файлов) ----------
+# ---------- WebSocket ----------
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -799,7 +842,7 @@ async def ws_handler(request):
                 text = data.get("text")
                 recipient_id = data.get("recipient_id")
                 group_id = data.get("group_id")
-                file_info = data.get("file_info")  # словарь с file_url, file_name, file_size, file_type, file_hash
+                file_info = data.get("file_info")
                 if not text and not file_info:
                     continue
                 conn = await asyncpg.connect(DATABASE_URL)
@@ -824,12 +867,12 @@ async def ws_handler(request):
                 message_obj = {
                     "id": msg_id,
                     "text": text,
-                    "file_info": file_info,
                     "sender": sender_dict
                 }
+                if file_info:
+                    message_obj["file_info"] = file_info
                 if group_id:
-                    # Групповой чат – рассылаем всем участникам (пока не реализовано, будет позже)
-                    # Для простоты пока шлём всем клиентам (но нужно фильтровать по участникам группы)
+                    # Групповой чат – пока не реализован, рассылаем всем (но нужно фильтровать)
                     targets = connected_clients.keys()
                 elif recipient_id:
                     targets = [uid, recipient_id]
@@ -850,10 +893,7 @@ async def ws_handler(request):
                 if message_id:
                     conn = await asyncpg.connect(DATABASE_URL)
                     try:
-                        await conn.execute(
-                            "UPDATE messages SET is_deleted=TRUE WHERE id=$1 AND sender_id=$2",
-                            message_id, uid
-                        )
+                        await conn.execute("UPDATE messages SET is_deleted=TRUE WHERE id=$1 AND sender_id=$2", message_id, uid)
                     finally:
                         await conn.close()
                     for client in connected_clients.values():
@@ -874,28 +914,28 @@ async def init_app():
     app.router.add_post("/auth/register", register_handler)
     app.router.add_get("/search-users", search_users_handler)
     app.router.add_get("/chats", chats_handler)
-    app.router.add_post("/upload", upload_handler)
-    app.router.add_get("/uploads/{filename}", download_handler)
-    app.router.add_post("/check-file-reputation", check_file_reputation_handler)
-    app.router.add_post("/complain-file", complain_file_handler)
-    app.router.add_get("/admin/complaints", admin_complaints_handler)
-    app.router.add_post("/admin/unblock-file", admin_unblock_file_handler)
-    app.router.add_post("/admin/confirm-dangerous", admin_confirm_dangerous_handler)
-    app.router.add_get("/security-events", security_events_handler)
+    app.router.add_get("/messages", messages_handler)
     app.router.add_get("/profile", profile_handler)
     app.router.add_post("/update-profile", update_profile_handler)
     app.router.add_post("/set-color", set_color_handler)
     app.router.add_post("/create-payment", create_payment_handler)
     app.router.add_post("/yoomoney-webhook", yoomoney_webhook)
     app.router.add_get("/subscription-status", subscription_status_handler)
+    app.router.add_post("/upload", upload_handler)
+    app.router.add_get("/uploads/{filename}", download_handler)
+    app.router.add_post("/check-file-reputation", check_file_reputation_handler)
+    app.router.add_post("/complain-file", complain_file_handler)
+    app.router.add_get("/security-events", security_events_handler)
     app.router.add_get("/admin/users", admin_users_handler)
     app.router.add_post("/admin/update-user", admin_update_user_handler)
     app.router.add_post("/admin/set-subscription-days", admin_set_subscription_handler)
+    app.router.add_get("/admin/complaints", admin_complaints_handler)
+    app.router.add_post("/admin/unblock-file", admin_unblock_file_handler)
+    app.router.add_post("/admin/confirm-dangerous", admin_confirm_dangerous_handler)
     app.router.add_get("/app-version", get_version_handler)
     app.router.add_post("/admin/set-version", admin_set_version_handler)
     app.router.add_post("/admin/broadcast", admin_broadcast_handler)
     app.router.add_get("/ws", ws_handler)
-    # Статическая раздача для загруженных файлов (но у нас уже есть эндпоинт /uploads/{filename})
     app.router.add_static('/uploads', UPLOAD_FOLDER, name='uploads')
     return app
 
