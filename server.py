@@ -91,7 +91,6 @@ async def init_db():
             created_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    # Таблица для версий приложения
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS app_version (
             id SERIAL PRIMARY KEY,
@@ -100,7 +99,6 @@ async def init_db():
             updated_at TIMESTAMP DEFAULT NOW()
         )
     ''')
-    # Вставляем начальные версии, если таблица пуста
     row = await conn.fetchval("SELECT COUNT(*) FROM app_version")
     if row == 0:
         await conn.execute("INSERT INTO app_version (stable_version, beta_version) VALUES ('1.0.0', '1.1.0-beta')")
@@ -296,7 +294,7 @@ async def messages_handler(request):
         await conn.close()
     return web.json_response(messages)
 
-# ---------- ПРОФИЛЬ И РЕДАКТИРОВАНИЕ ----------
+# ---------- ПРОФИЛЬ ----------
 async def profile_handler(request):
     user_id = request.query.get("user_id")
     if not user_id:
@@ -399,7 +397,7 @@ async def subscription_status_handler(request):
         return web.json_response({"active": True, "plan": sub['plan_type'], "days_left": days_left, "expires": sub['end_date'].isoformat()})
     return web.json_response({"active": False})
 
-# ---------- АДМИНКА ----------
+# ---------- АДМИНКА (ИСПРАВЛЕНА) ----------
 async def admin_users_handler(request):
     admin_id = request.query.get("admin_id")
     if not await is_admin(int(admin_id)):
@@ -424,7 +422,12 @@ async def admin_update_user_handler(request):
         return web.json_response({"error": "Invalid field"}, status=400)
     conn = await asyncpg.connect(DATABASE_URL)
     try:
+        # Обновляем поле
         await conn.execute(f"UPDATE users SET {field}=$1 WHERE id=$2", value, user_id)
+        # Если обновляли is_admin, нужно убедиться, что значение 0 или 1
+        if field == "is_admin":
+            # Преобразуем в int на всякий случай
+            await conn.execute(f"UPDATE users SET {field}=$1 WHERE id=$2", int(value), user_id)
     finally:
         await conn.close()
     return web.json_response({"status": "ok"})
@@ -457,9 +460,8 @@ async def admin_set_subscription_handler(request):
         await conn.close()
     return web.json_response({"status": "ok", "new_end_date": new_end.isoformat()})
 
-# ---------- УПРАВЛЕНИЕ ВЕРСИЯМИ ----------
+# ---------- ВЕРСИИ ----------
 async def get_version_handler(request):
-    # Получить версии из БД
     conn = await asyncpg.connect(DATABASE_URL)
     try:
         row = await conn.fetchrow("SELECT stable_version, beta_version FROM app_version ORDER BY id DESC LIMIT 1")
@@ -482,6 +484,23 @@ async def admin_set_version_handler(request):
         await conn.execute("UPDATE app_version SET stable_version=$1, beta_version=$2, updated_at=NOW()", stable, beta)
     finally:
         await conn.close()
+    return web.json_response({"status": "ok"})
+
+# ---------- РАССЫЛКА УВЕДОМЛЕНИЙ ВСЕМ ОНЛАЙН-КЛИЕНТАМ ----------
+async def admin_broadcast_handler(request):
+    data = await request.json()
+    admin_id = data.get("admin_id")
+    if not await is_admin(int(admin_id)):
+        return web.json_response({"error": "Forbidden"}, status=403)
+    message = data.get("message")
+    if not message:
+        return web.json_response({"error": "No message"}, status=400)
+    # Рассылаем всем подключённым клиентам
+    for client in connected_clients.values():
+        try:
+            await client.send_json({"type": "broadcast", "message": message})
+        except:
+            pass
     return web.json_response({"status": "ok"})
 
 # ---------- WEBSOCKET ----------
@@ -581,6 +600,7 @@ async def init_app():
     app.router.add_post("/admin/set-subscription-days", admin_set_subscription_handler)
     app.router.add_get("/app-version", get_version_handler)
     app.router.add_post("/admin/set-version", admin_set_version_handler)
+    app.router.add_post("/admin/broadcast", admin_broadcast_handler)
     app.router.add_get("/ws", ws_handler)
     return app
 
