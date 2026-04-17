@@ -74,7 +74,7 @@ async def init_db():
             sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
             group_id INTEGER,
-            text TEXT,
+            text TEXT NOT NULL DEFAULT '',
             file_url TEXT,
             file_name TEXT,
             file_size INTEGER,
@@ -85,17 +85,27 @@ async def init_db():
         )
     ''')
 
-    for col in ['group_id', 'file_hash', 'file_url', 'file_name', 'file_size', 'file_type']:
+    # Добавляем колонки, если их нет
+    for col, col_type in [('group_id', 'INTEGER'), ('file_hash', 'TEXT'), ('file_url', 'TEXT'),
+                         ('file_name', 'TEXT'), ('file_size', 'INTEGER'), ('file_type', 'TEXT')]:
         try:
-            await conn.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} TEXT")
-        except:
-            pass
+            await conn.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} {col_type}")
+        except Exception as e:
+            print(f"⚠️ Не удалось добавить колонку {col}: {e}")
 
+    # Убеждаемся, что file_size - INTEGER
     try:
         await conn.execute("ALTER TABLE messages ALTER COLUMN file_size TYPE INTEGER USING (file_size::integer)")
         print("✅ Тип file_size изменён на INTEGER")
     except Exception as e:
         print(f"⚠️ Не удалось изменить тип file_size: {e}")
+
+    # Убеждаемся, что text имеет NOT NULL DEFAULT ''
+    try:
+        await conn.execute("ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''")
+        await conn.execute("ALTER TABLE messages ALTER COLUMN text SET NOT NULL")
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить колонку text: {e}")
 
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
@@ -459,7 +469,9 @@ async def update_profile_handler(request):
         if new_bio is not None:
             await conn.execute("UPDATE users SET bio=$1 WHERE id=$2", new_bio, user_id)
         if hide_phone is not None:
-            await conn.execute("UPDATE users SET hide_phone=$1 WHERE id=$2", hide_phone, user_id)
+            # Преобразуем в bool
+            hide_phone_bool = bool(hide_phone) if not isinstance(hide_phone, bool) else hide_phone
+            await conn.execute("UPDATE users SET hide_phone=$1 WHERE id=$2", hide_phone_bool, user_id)
     finally:
         await conn.close()
     return web.json_response({"status": "ok"})
@@ -591,7 +603,7 @@ async def download_handler(request):
         if not msg:
             return web.json_response({"error": "File not found"}, status=404)
         if msg["group_id"] is not None:
-            # Проверка доступа к группе (заглушка)
+            # Заглушка: в будущем добавить проверку членства в группе
             pass
         else:
             if msg["recipient_id"] is not None:
@@ -815,7 +827,7 @@ async def ws_handler(request):
         async for msg in ws:
             data = json.loads(msg.data)
             if data["action"] == "send":
-                text = data.get("text")
+                text = data.get("text") or ""   # исправлено: если None, то пустая строка
                 recipient_id = data.get("recipient_id")
                 group_id = data.get("group_id")
                 file_info = data.get("file_info")
