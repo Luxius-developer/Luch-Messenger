@@ -95,6 +95,13 @@ async def init_db():
         except:
             pass
 
+    # Если file_size имеет тип TEXT, преобразуем в INTEGER
+    try:
+        await conn.execute("ALTER TABLE messages ALTER COLUMN file_size TYPE INTEGER USING (file_size::integer)")
+        print("✅ Тип file_size изменён на INTEGER")
+    except Exception as e:
+        print(f"⚠️ Не удалось изменить тип file_size: {e}")
+
     # Индексы
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
@@ -852,12 +859,17 @@ async def ws_handler(request):
                     continue
                 conn = await asyncpg.connect(DATABASE_URL)
                 try:
+                    # Исправление: преобразуем file_size в строку, если он есть (для совместимости с TEXT)
+                    if file_info and file_info.get("file_size") is not None:
+                        file_size_val = str(file_info["file_size"])
+                    else:
+                        file_size_val = None
                     msg_id = await conn.fetchval(
                         "INSERT INTO messages (sender_id, recipient_id, group_id, text, file_url, file_name, file_size, file_type, file_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
                         uid, recipient_id, group_id, text,
                         file_info.get("file_url") if file_info else None,
                         file_info.get("file_name") if file_info else None,
-                        file_info.get("file_size") if file_info else None,
+                        file_size_val,
                         file_info.get("file_type") if file_info else None,
                         file_info.get("file_hash") if file_info else None
                     )
