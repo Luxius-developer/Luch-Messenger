@@ -831,7 +831,7 @@ async def admin_broadcast_handler(request):
             pass
     return web.json_response({"status": "ok"})
 
-# ---------- WebSocket ----------
+# ---------- WebSocket (ИСПРАВЛЕНО) ----------
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -859,11 +859,11 @@ async def ws_handler(request):
                     continue
                 conn = await asyncpg.connect(DATABASE_URL)
                 try:
-                    # Исправление: преобразуем file_size в строку, если он есть (для совместимости с TEXT)
+                    # Исправлено: file_size сохраняем как INTEGER
+                    file_size_val = None
                     if file_info and file_info.get("file_size") is not None:
-                        file_size_val = str(file_info["file_size"])
-                    else:
-                        file_size_val = None
+                        file_size_val = int(file_info["file_size"])
+
                     msg_id = await conn.fetchval(
                         "INSERT INTO messages (sender_id, recipient_id, group_id, text, file_url, file_name, file_size, file_type, file_hash) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
                         uid, recipient_id, group_id, text,
@@ -881,11 +881,17 @@ async def ws_handler(request):
                     await conn.close()
                 sender_dict = dict(sender) if sender else {}
                 sender_dict = json_serializable(sender_dict)
+
+                # Исправлено: добавлены recipient_id, group_id и created_at
                 message_obj = {
                     "id": msg_id,
                     "text": text,
-                    "sender": sender_dict
+                    "sender": sender_dict,
+                    "recipient_id": recipient_id,
+                    "group_id": group_id,
+                    "created_at": datetime.now().isoformat()
                 }
+
                 if file_info:
                     message_obj["file_info"] = file_info
                 if group_id:
