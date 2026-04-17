@@ -593,6 +593,7 @@ async def upload_handler(request):
     save_path = os.path.join(UPLOAD_FOLDER, unique_name)
     async with aiofiles.open(save_path, "wb") as f:
         await f.write(file_data.read())
+    print(f"[Upload] Файл сохранён: {save_path}, размер {file_size}")
 
     mime_type, _ = mimetypes.guess_type(original_filename)
     if not mime_type:
@@ -701,6 +702,7 @@ async def admin_update_user_handler(request):
         if field == "is_admin":
             value = 1 if value in (1, "1", True, "true") else 0
         await conn.execute(f"UPDATE users SET {field}=$1 WHERE id=$2", value, user_id)
+        print(f"[Admin] Обновлено поле {field} для user {user_id} на {value}")
     finally:
         await conn.close()
     return web.json_response({"status": "ok"})
@@ -722,7 +724,10 @@ async def admin_set_subscription_handler(request):
             await conn.execute("UPDATE subscriptions SET end_date=$1 WHERE id=$2", new_end, sub['id'])
         else:
             new_end = datetime.now() + timedelta(days=days)
-            await conn.execute("INSERT INTO subscriptions (user_id, plan_type, end_date, status) VALUES ($1, 'admin', $2, 'active')", target_user_id, new_end)
+            await conn.execute(
+                "INSERT INTO subscriptions (user_id, plan_type, end_date, status) VALUES ($1, 'admin', $2, 'active')",
+                target_user_id, new_end
+            )
     finally:
         await conn.close()
     return web.json_response({"status": "ok", "new_end_date": new_end.isoformat()})
@@ -872,7 +877,6 @@ async def ws_handler(request):
                 if file_info:
                     message_obj["file_info"] = file_info
                 if group_id:
-                    # Групповой чат – пока не реализован, рассылаем всем (но нужно фильтровать)
                     targets = connected_clients.keys()
                 elif recipient_id:
                     targets = [uid, recipient_id]
