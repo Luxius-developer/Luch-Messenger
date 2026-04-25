@@ -50,6 +50,7 @@ async def init_db():
     print("🔧 Инициализация базы данных...")
     conn = await asyncpg.connect(DATABASE_URL)
 
+    # Таблица users
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -67,6 +68,14 @@ async def init_db():
         )
     ''')
 
+    # Пытаемся исправить тип hide_phone, если он был создан как TEXT
+    try:
+        await conn.execute("ALTER TABLE users ALTER COLUMN hide_phone TYPE BOOLEAN USING hide_phone::boolean")
+        print("✅ Тип hide_phone изменён на BOOLEAN")
+    except Exception as e:
+        print(f"⚠️ Не удалось изменить hide_phone: {e} (возможно, уже BOOLEAN)")
+
+    # Таблица messages
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
@@ -84,30 +93,32 @@ async def init_db():
         )
     ''')
 
-    # Добавляем недостающие колонки (если таблица существовала раньше)
+    # Добавляем недостающие колонки, если таблица существовала ранее
     for col in ['group_id', 'file_hash', 'file_url', 'file_name', 'file_size', 'file_type']:
         try:
             await conn.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} TEXT")
         except:
             pass
 
-    # Принудительно меняем тип file_size на INTEGER, если он был TEXT
+    # Принудительно меняем тип file_size на INTEGER
     try:
         await conn.execute("ALTER TABLE messages ALTER COLUMN file_size TYPE INTEGER USING (file_size::integer)")
         print("✅ Тип file_size изменён на INTEGER")
     except Exception as e:
         print(f"⚠️ Не удалось изменить тип file_size: {e}")
 
-    # Разрешаем NULL в колонке text (чтобы можно было отправлять файлы без подписи)
+    # Разрешаем NULL в тексте сообщения
     try:
         await conn.execute("ALTER TABLE messages ALTER COLUMN text DROP NOT NULL")
         print("✅ Колонка text теперь может быть NULL")
     except Exception as e:
         print(f"⚠️ Не удалось изменить text на NULL: {e}")
 
+    # Индексы
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
 
+    # Остальные таблицы
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
             id SERIAL PRIMARY KEY,
@@ -467,8 +478,14 @@ async def update_profile_handler(request):
         if new_bio is not None:
             await conn.execute("UPDATE users SET bio=$1 WHERE id=$2", new_bio, user_id)
         if hide_phone is not None:
-            hide_phone_bool = bool(hide_phone)
-            await conn.execute("UPDATE users SET hide_phone=$1 WHERE id=$2", hide_phone_bool, user_id)
+            # Стабильная обработка: преобразуем в строку 'true' или 'false', если поле осталось текстовым
+            if isinstance(hide_phone, bool):
+                hide_phone_val = 'true' if hide_phone else 'false'
+            elif isinstance(hide_phone, str):
+                hide_phone_val = hide_phone.lower()
+            else:
+                hide_phone_val = 'false'
+            await conn.execute("UPDATE users SET hide_phone=$1 WHERE id=$2", hide_phone_val, user_id)
     finally:
         await conn.close()
     return web.json_response({"status": "ok"})
