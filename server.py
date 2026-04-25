@@ -34,7 +34,6 @@ UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 FILE_RETENTION_DAYS = 30
 REPUTATION_THRESHOLD = 3
-VIRUSTOTAL_API_KEY = os.environ.get("VIRUSTOTAL_API_KEY", "")
 
 connected_clients = {}
 
@@ -74,7 +73,7 @@ async def init_db():
             sender_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
             group_id INTEGER,
-            text TEXT NOT NULL DEFAULT '',
+            text TEXT,
             file_url TEXT,
             file_name TEXT,
             file_size INTEGER,
@@ -85,27 +84,26 @@ async def init_db():
         )
     ''')
 
-    # Добавляем колонки, если их нет
-    for col, col_type in [('group_id', 'INTEGER'), ('file_hash', 'TEXT'), ('file_url', 'TEXT'),
-                         ('file_name', 'TEXT'), ('file_size', 'INTEGER'), ('file_type', 'TEXT')]:
+    # Добавляем недостающие колонки (если таблица существовала раньше)
+    for col in ['group_id', 'file_hash', 'file_url', 'file_name', 'file_size', 'file_type']:
         try:
-            await conn.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} {col_type}")
-        except Exception as e:
-            print(f"⚠️ Не удалось добавить колонку {col}: {e}")
+            await conn.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} TEXT")
+        except:
+            pass
 
-    # Убеждаемся, что file_size - INTEGER
+    # Принудительно меняем тип file_size на INTEGER, если он был TEXT
     try:
         await conn.execute("ALTER TABLE messages ALTER COLUMN file_size TYPE INTEGER USING (file_size::integer)")
         print("✅ Тип file_size изменён на INTEGER")
     except Exception as e:
         print(f"⚠️ Не удалось изменить тип file_size: {e}")
 
-    # Убеждаемся, что text имеет NOT NULL DEFAULT ''
+    # Разрешаем NULL в колонке text (чтобы можно было отправлять файлы без подписи)
     try:
-        await conn.execute("ALTER TABLE messages ALTER COLUMN text SET DEFAULT ''")
-        await conn.execute("ALTER TABLE messages ALTER COLUMN text SET NOT NULL")
+        await conn.execute("ALTER TABLE messages ALTER COLUMN text DROP NOT NULL")
+        print("✅ Колонка text теперь может быть NULL")
     except Exception as e:
-        print(f"⚠️ Не удалось обновить колонку text: {e}")
+        print(f"⚠️ Не удалось изменить text на NULL: {e}")
 
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
@@ -469,8 +467,7 @@ async def update_profile_handler(request):
         if new_bio is not None:
             await conn.execute("UPDATE users SET bio=$1 WHERE id=$2", new_bio, user_id)
         if hide_phone is not None:
-            # Преобразуем в bool
-            hide_phone_bool = bool(hide_phone) if not isinstance(hide_phone, bool) else hide_phone
+            hide_phone_bool = bool(hide_phone)
             await conn.execute("UPDATE users SET hide_phone=$1 WHERE id=$2", hide_phone_bool, user_id)
     finally:
         await conn.close()
@@ -603,8 +600,7 @@ async def download_handler(request):
         if not msg:
             return web.json_response({"error": "File not found"}, status=404)
         if msg["group_id"] is not None:
-            # Заглушка: в будущем добавить проверку членства в группе
-            pass
+            pass  # проверка членства в группе может быть добавлена позже
         else:
             if msg["recipient_id"] is not None:
                 if int(user_id) not in (msg["sender_id"], msg["recipient_id"]):
@@ -802,7 +798,7 @@ async def admin_broadcast_handler(request):
             pass
     return web.json_response({"status": "ok"})
 
-# ---------- WebSocket ----------
+# ---------- WebSocket (исправлено) ----------
 async def ws_handler(request):
     print(f"[WS] Incoming request, Upgrade header: {request.headers.get('Upgrade')}")
     ws = web.WebSocketResponse()
@@ -827,7 +823,7 @@ async def ws_handler(request):
         async for msg in ws:
             data = json.loads(msg.data)
             if data["action"] == "send":
-                text = data.get("text") or ""   # исправлено: если None, то пустая строка
+                text = data.get("text") or ""   # Пустая строка вместо None
                 recipient_id = data.get("recipient_id")
                 group_id = data.get("group_id")
                 file_info = data.get("file_info")
