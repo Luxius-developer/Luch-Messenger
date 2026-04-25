@@ -32,8 +32,6 @@ if not DATABASE_URL:
 MAX_FILE_SIZE = 50 * 1024 * 1024
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-FILE_RETENTION_DAYS = 30
-REPUTATION_THRESHOLD = 3
 
 connected_clients = {}
 
@@ -50,7 +48,6 @@ async def init_db():
     print("🔧 Инициализация базы данных...")
     conn = await asyncpg.connect(DATABASE_URL)
 
-    # Таблица users
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -68,14 +65,12 @@ async def init_db():
         )
     ''')
 
-    # Пытаемся исправить тип hide_phone, если он был создан как TEXT
     try:
         await conn.execute("ALTER TABLE users ALTER COLUMN hide_phone TYPE BOOLEAN USING hide_phone::boolean")
         print("✅ Тип hide_phone изменён на BOOLEAN")
     except Exception as e:
-        print(f"⚠️ Не удалось изменить hide_phone: {e} (возможно, уже BOOLEAN)")
+        print(f"⚠️ Не удалось изменить hide_phone: {e}")
 
-    # Таблица messages
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id SERIAL PRIMARY KEY,
@@ -93,32 +88,27 @@ async def init_db():
         )
     ''')
 
-    # Добавляем недостающие колонки, если таблица существовала ранее
     for col in ['group_id', 'file_hash', 'file_url', 'file_name', 'file_size', 'file_type']:
         try:
             await conn.execute(f"ALTER TABLE messages ADD COLUMN IF NOT EXISTS {col} TEXT")
         except:
             pass
 
-    # Принудительно меняем тип file_size на INTEGER
     try:
         await conn.execute("ALTER TABLE messages ALTER COLUMN file_size TYPE INTEGER USING (file_size::integer)")
         print("✅ Тип file_size изменён на INTEGER")
     except Exception as e:
         print(f"⚠️ Не удалось изменить тип file_size: {e}")
 
-    # Разрешаем NULL в тексте сообщения
     try:
         await conn.execute("ALTER TABLE messages ALTER COLUMN text DROP NOT NULL")
         print("✅ Колонка text теперь может быть NULL")
     except Exception as e:
         print(f"⚠️ Не удалось изменить text на NULL: {e}")
 
-    # Индексы
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_group ON messages(group_id)")
     await conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id)")
 
-    # Остальные таблицы
     await conn.execute('''
         CREATE TABLE IF NOT EXISTS subscriptions (
             id SERIAL PRIMARY KEY,
@@ -478,7 +468,6 @@ async def update_profile_handler(request):
         if new_bio is not None:
             await conn.execute("UPDATE users SET bio=$1 WHERE id=$2", new_bio, user_id)
         if hide_phone is not None:
-            # Стабильная обработка: преобразуем в строку 'true' или 'false', если поле осталось текстовым
             if isinstance(hide_phone, bool):
                 hide_phone_val = 'true' if hide_phone else 'false'
             elif isinstance(hide_phone, str):
@@ -617,7 +606,7 @@ async def download_handler(request):
         if not msg:
             return web.json_response({"error": "File not found"}, status=404)
         if msg["group_id"] is not None:
-            pass  # проверка членства в группе может быть добавлена позже
+            pass
         else:
             if msg["recipient_id"] is not None:
                 if int(user_id) not in (msg["sender_id"], msg["recipient_id"]):
@@ -815,7 +804,7 @@ async def admin_broadcast_handler(request):
             pass
     return web.json_response({"status": "ok"})
 
-# ---------- WebSocket (исправлено) ----------
+# ---------- WebSocket ----------
 async def ws_handler(request):
     print(f"[WS] Incoming request, Upgrade header: {request.headers.get('Upgrade')}")
     ws = web.WebSocketResponse()
@@ -840,7 +829,7 @@ async def ws_handler(request):
         async for msg in ws:
             data = json.loads(msg.data)
             if data["action"] == "send":
-                text = data.get("text") or ""   # Пустая строка вместо None
+                text = data.get("text") or ""
                 recipient_id = data.get("recipient_id")
                 group_id = data.get("group_id")
                 file_info = data.get("file_info")
